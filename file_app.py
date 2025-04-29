@@ -2,99 +2,93 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import plotly.graph_objs as go
+import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, LSTM
 
 st.set_page_config(page_title="Prediksi Bitcoin", layout="wide")
-st.title("Prediksi Harga Bitcoin (IDR) - Live & Analisis")
+st.title("Prediksi Harga Bitcoin (IDR) - Live Chart & Analisis")
 
-# --- Load Data dari CoinGecko ---
+# --- Ambil Data ---
+@st.cache_data
 def load_data():
     url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
     params = {"vs_currency": "idr", "days": "7", "interval": "hourly"}
-    response = requests.get(url, params=params)
-
-    if response.status_code != 200:
-        st.error("Gagal mengambil data dari API.")
+    res = requests.get(url, params=params)
+    if res.status_code != 200:
+        st.error("Gagal mengambil data!")
         st.stop()
-    
-    data = response.json()
-    if "prices" not in data or not data["prices"]:
-        st.error("Data harga kosong!")
+    data = res.json()
+    if "prices" not in data:
+        st.error("Data tidak ditemukan!")
         st.stop()
-
-    prices = [item[1] for item in data["prices"]]
-    dates = [pd.to_datetime(item[0], unit='ms').tz_localize('UTC').tz_convert('Asia/Jakarta') for item in data["prices"]]
-    df = pd.DataFrame({"Datetime": dates, "Price": prices})
-    return df
+    times = [pd.to_datetime(x[0], unit="ms").tz_localize("UTC").tz_convert("Asia/Jakarta") for x in data["prices"]]
+    prices = [x[1] for x in data["prices"]]
+    return pd.DataFrame({"Datetime": times, "Price": prices})
 
 df = load_data()
+df["SMA_20"] = df["Price"].rolling(20).mean()
 
-# --- Indikator Teknikal ---
-df["SMA_20"] = df["Price"].rolling(window=20).mean()
+low_14 = df["Price"].rolling(14).min()
+high_14 = df["Price"].rolling(14).max()
+df["%K"] = 100 * (df["Price"] - low_14) / (high_14 - low_14)
+df["%D"] = df["%K"].rolling(3).mean()
 
-low_14 = df["Price"].rolling(window=14).min()
-high_14 = df["Price"].rolling(window=14).max()
-df["%K"] = 100 * ((df["Price"] - low_14) / (high_14 - low_14))
-df["%D"] = df["%K"].rolling(window=3).mean()
-
-# --- Sinyal Buy/Sell/Hold ---
-def generate_signal(row):
+def signal(row):
     if row["%K"] < 20 and row["%D"] < 20:
         return "Buy"
     elif row["%K"] > 80 and row["%D"] > 80:
         return "Sell"
-    else:
-        return "Hold"
+    return "Hold"
 
-df["Signal"] = df.apply(generate_signal, axis=1)
+df["Signal"] = df.apply(signal, axis=1)
 
-# --- Chart Interaktif dengan Plotly ---
-st.subheader("Live Chart Harga Bitcoin + SMA")
-fig = go.Figure()
-fig.add_trace(go.Scatter(x=df["Datetime"], y=df["Price"], name="Harga", line=dict(color='blue')))
-fig.add_trace(go.Scatter(x=df["Datetime"], y=df["SMA_20"], name="SMA 20", line=dict(color='orange', dash='dot')))
-fig.update_layout(xaxis_title="Waktu", yaxis_title="Harga (IDR)", template="plotly_white")
-st.plotly_chart(fig, use_container_width=True)
+# --- Chart Harga ---
+st.subheader("Grafik Harga Bitcoin")
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(df["Datetime"], df["Price"], label="Harga")
+ax.plot(df["Datetime"], df["SMA_20"], label="SMA 20", linestyle="--")
+ax.set_xlabel("Waktu")
+ax.set_ylabel("Harga (IDR)")
+ax.legend()
+st.pyplot(fig)
 
 # --- Chart Stochastic Oscillator ---
 st.subheader("Stochastic Oscillator")
-fig_stoch = go.Figure()
-fig_stoch.add_trace(go.Scatter(x=df["Datetime"], y=df["%K"], name="%K"))
-fig_stoch.add_trace(go.Scatter(x=df["Datetime"], y=df["%D"], name="%D"))
-fig_stoch.update_layout(xaxis_title="Waktu", yaxis_title="Nilai", template="plotly_white")
-st.plotly_chart(fig_stoch, use_container_width=True)
+fig2, ax2 = plt.subplots(figsize=(12, 4))
+ax2.plot(df["Datetime"], df["%K"], label="%K")
+ax2.plot(df["Datetime"], df["%D"], label="%D")
+ax2.axhline(80, color='r', linestyle='--')
+ax2.axhline(20, color='g', linestyle='--')
+ax2.legend()
+st.pyplot(fig2)
 
-# --- Prediksi Harga Selanjutnya ---
-st.subheader("Prediksi Harga Berikutnya (LSTM)")
+# --- Prediksi LSTM ---
+st.subheader("Prediksi Harga Selanjutnya (LSTM)")
 
 scaler = MinMaxScaler()
-scaled = scaler.fit_transform(df[["Price"]].values)
+scaled = scaler.fit_transform(df[["Price"]])
 
-# Dataset LSTM
 def create_dataset(data, look_back=24):
-    X, Y = [], []
+    X, y = [], []
     for i in range(len(data) - look_back):
         X.append(data[i:i+look_back])
-        Y.append(data[i+look_back])
-    return np.array(X), np.array(Y)
+        y.append(data[i+look_back])
+    return np.array(X), np.array(y)
 
 X, y = create_dataset(scaled)
-X = X.reshape((X.shape[0], X.shape[1], 1))
+X = X.reshape(X.shape[0], X.shape[1], 1)
 
 model = Sequential()
 model.add(LSTM(50, return_sequences=False, input_shape=(X.shape[1], 1)))
 model.add(Dense(1))
-model.compile(optimizer='adam', loss='mean_squared_error')
+model.compile(optimizer="adam", loss="mean_squared_error")
 model.fit(X, y, epochs=10, batch_size=16, verbose=0)
 
-# Prediksi Harga Berikutnya
-last_seq = scaled[-24:].reshape(1, 24, 1)
-pred = model.predict(last_seq)
+last_input = scaled[-24:].reshape(1, 24, 1)
+pred = model.predict(last_input)
 pred_price = scaler.inverse_transform(pred)[0][0]
-st.metric("Prediksi Harga Selanjutnya (IDR)", f"{pred_price:,.0f}")
 
-# --- Sinyal Terbaru ---
-st.success(f"Sinyal Terbaru: **{df['Signal'].iloc[-1]}**")
+st.metric("Prediksi Harga Selanjutnya", f"Rp {pred_price:,.0f}")
+st.info(f"Sinyal Terbaru: **{df['Signal'].iloc[-1]}**")
