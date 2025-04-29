@@ -7,86 +7,110 @@ from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 
-st.set_page_config(page_title="Prediksi Bitcoin", layout="wide")
-st.title("Prediksi Harga Bitcoin (IDR) - Live & Analisis")
+st.set_page_config(layout="wide")
+st.title("Prediksi Harga Bitcoin (IDR) + Sinyal & Analisis")
 
-# --- Ambil Data ---
+# --- Fungsi Ambil Data ---
 @st.cache_data
 def load_data():
-    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-    params = {"vs_currency": "idr", "days": "7", "interval": "hourly"}
-    res = requests.get(url, params=params)
-    data = res.json()
-    if "prices" not in data:
-        return None
-    times = [pd.to_datetime(x[0], unit="ms").tz_localize("UTC").tz_convert("Asia/Jakarta") for x in data["prices"]]
-    prices = [x[1] for x in data["prices"]]
-    return pd.DataFrame({"Datetime": times, "Price": prices})
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+        params = {"vs_currency": "idr", "days": "7", "interval": "hourly"}
+        res = requests.get(url, params=params, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        if "prices" in data and data["prices"]:
+            times = [pd.to_datetime(x[0], unit="ms").tz_localize("UTC").tz_convert("Asia/Jakarta") for x in data["prices"]]
+            prices = [x[1] for x in data["prices"]]
+            return pd.DataFrame({"Datetime": times, "Price": prices})
+        st.warning("CoinGecko kosong, mencoba Binance...")
+    except:
+        st.warning("Gagal dari CoinGecko, mencoba Binance...")
 
-df = load_data()
-if df is None or df.empty:
-    st.error("Gagal mengambil data.")
-    st.stop()
+    # Fallback Binance
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": "BTCUSDT", "interval": "1h", "limit": 168}
+        res = requests.get(url, params=params, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        times = [pd.to_datetime(int(x[0]), unit="ms").tz_localize("UTC").tz_convert("Asia/Jakarta") for x in data]
+        prices = [float(x[4]) * 16000 for x in data]  # USD to IDR
+        return pd.DataFrame({"Datetime": times, "Price": prices})
+    except Exception as e:
+        st.error(f"Binance gagal juga: {e}")
+        return pd.DataFrame()
 
-# --- Tambahkan Indikator ---
-df["SMA_20"] = df["Price"].rolling(20).mean()
-low_14 = df["Price"].rolling(14).min()
-high_14 = df["Price"].rolling(14).max()
-df["%K"] = 100 * (df["Price"] - low_14) / (high_14 - low_14)
-df["%D"] = df["%K"].rolling(3).mean()
+# --- Hitung Indikator ---
+def compute_indicators(df):
+    df["SMA20"] = df["Price"].rolling(window=20).mean()
+    df["%K"] = (df["Price"] - df["Price"].rolling(14).min()) / (df["Price"].rolling(14).max() - df["Price"].rolling(14).min()) * 100
+    df["%D"] = df["%K"].rolling(3).mean()
+    return df
 
-def signal(row):
-    if row["%K"] < 20 and row["%D"] < 20:
+# --- Sinyal Trading ---
+def generate_signal(row):
+    if row["%K"] < 20 and row["%K"] > row["%D"]:
         return "Buy"
-    elif row["%K"] > 80 and row["%D"] > 80:
+    elif row["%K"] > 80 and row["%K"] < row["%D"]:
         return "Sell"
-    return "Hold"
-df["Signal"] = df.apply(signal, axis=1)
+    else:
+        return "Hold"
 
-# --- Grafik Harga ---
-st.subheader("Grafik Harga Bitcoin")
-fig, ax = plt.subplots()
-ax.plot(df["Datetime"], df["Price"], label="Harga")
-ax.plot(df["Datetime"], df["SMA_20"], label="SMA 20", linestyle="--")
-ax.set_ylabel("Harga (IDR)")
-ax.legend()
-st.pyplot(fig)
-
-# --- Grafik Stochastic ---
-st.subheader("Stochastic Oscillator")
-fig2, ax2 = plt.subplots()
-ax2.plot(df["Datetime"], df["%K"], label="%K")
-ax2.plot(df["Datetime"], df["%D"], label="%D")
-ax2.axhline(80, color="red", linestyle="--")
-ax2.axhline(20, color="green", linestyle="--")
-ax2.legend()
-st.pyplot(fig2)
-
-# --- Prediksi LSTM ---
-st.subheader("Prediksi Harga Berikutnya")
-
-scaler = MinMaxScaler()
-scaled = scaler.fit_transform(df[["Price"]].dropna())
-
-def create_dataset(data, look_back=24):
+# --- Prediksi Harga Selanjutnya ---
+def predict_price(df):
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(df["Price"].values.reshape(-1, 1))
     X, y = [], []
-    for i in range(len(data) - look_back):
-        X.append(data[i:i+look_back])
-        y.append(data[i+look_back])
-    return np.array(X), np.array(y)
+    for i in range(60, len(scaled)):
+        X.append(scaled[i-60:i])
+        y.append(scaled[i])
+    X, y = np.array(X), np.array(y)
 
-X, y = create_dataset(scaled)
-X = X.reshape(X.shape[0], X.shape[1], 1)
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=(X.shape[1], 1)),
+        LSTM(50),
+        Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mean_squared_error")
+    model.fit(X, y, epochs=5, batch_size=32, verbose=0)
 
-model = Sequential()
-model.add(LSTM(50, return_sequences=False, input_shape=(X.shape[1], 1)))
-model.add(Dense(1))
-model.compile(optimizer="adam", loss="mean_squared_error")
-model.fit(X, y, epochs=5, batch_size=16, verbose=0)
+    last_60 = scaled[-60:]
+    last_60 = last_60.reshape((1, 60, 1))
+    pred_scaled = model.predict(last_60, verbose=0)
+    pred_price = scaler.inverse_transform(pred_scaled)
+    return pred_price[0][0]
 
-last_input = scaled[-24:].reshape(1, 24, 1)
-pred = model.predict(last_input)
-pred_price = scaler.inverse_transform(pred)[0][0]
+# --- Main Eksekusi ---
+df = load_data()
 
-st.metric("Prediksi Harga Berikutnya", f"Rp {pred_price:,.0f}")
-st.info(f"Sinyal Terbaru: **{df['Signal'].iloc[-1]}**")
+if not df.empty:
+    df = compute_indicators(df)
+    df["Signal"] = df.apply(generate_signal, axis=1)
+    predicted_price = predict_price(df)
+
+    st.subheader("Live Chart Harga Bitcoin")
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(df["Datetime"], df["Price"], label="Harga", color="orange")
+    ax.plot(df["Datetime"], df["SMA20"], label="SMA 20", color="blue")
+    ax.set_xlabel("Waktu")
+    ax.set_ylabel("Harga (IDR)")
+    ax.legend()
+    st.pyplot(fig)
+
+    st.subheader("Indikator Stochastic Oscillator")
+    fig2, ax2 = plt.subplots(figsize=(12, 3))
+    ax2.plot(df["Datetime"], df["%K"], label="%K", color="green")
+    ax2.plot(df["Datetime"], df["%D"], label="%D", color="red")
+    ax2.axhline(80, color='gray', linestyle='--')
+    ax2.axhline(20, color='gray', linestyle='--')
+    ax2.set_ylabel("Oscillator")
+    ax2.legend()
+    st.pyplot(fig2)
+
+    st.subheader("Sinyal Trading")
+    st.dataframe(df[["Datetime", "Price", "Signal"]].tail(10), use_container_width=True)
+
+    st.success(f"Prediksi harga Bitcoin selanjutnya: **Rp {int(predicted_price):,}**")
+else:
+    st.error("Data tidak tersedia.")
